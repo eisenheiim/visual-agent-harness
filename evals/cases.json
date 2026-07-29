@@ -1,0 +1,57 @@
+[
+  {
+    "id": "calc_basic",
+    "prompt": "Use the calculator tool to compute (12 + 3) * 2. Put only the number in your final answer.",
+    "must_call_tools": ["calculator"],
+    "answer_contains": ["30"],
+    "max_thinks": 6,
+    "max_iterations": 6,
+    "temperature": 0.0
+  },
+  {
+    "id": "unit_temp",
+    "prompt": "Use unit_convert to convert 0 celsius to fahrenheit. Final answer should mention 32.",
+    "must_call_tools": ["unit_convert"],
+    "answer_contains": ["32"],
+    "max_iterations": 6,
+    "temperature": 0.0
+  },
+  {
+    "id": "datetime_utc",
+    "prompt": "Call datetime_now with timezone UTC and tell me the year from the result.",
+    "must_call_tools": ["datetime_now"],
+    "answer_contains": ["2026"],
+    "max_iterations": 6,
+    "temperature": 0.0
+  },
+  {
+    "id": "search_paris_weather",
+    "prompt": "Use the search tool with query 'weather in Paris' and report the temperature you find.",
+    "must_call_tools": ["search"],
+    "answer_contains": ["18"],
+    "max_iterations": 8,
+    "temperature": 0.0,
+    "notes": "Works best with VAH_SEARCH_BACKEND=mock"
+  },
+  {
+    "id": "remember_and_rag",
+    "prompt": "What is my favorite city? Answer using long-term memory if available.",
+    "seed_memories": [
+      {"text": "User favorite city is Tokyo", "tags": ["preference", "eval"]}
+    ],
+    "use_rag": true,
+    "forbid_tools": [],
+    "answer_contains": ["Tokyo"],
+    "max_iterations": 6,
+    "temperature": 0.0
+  },
+  {
+    "id": "no_tools_reasoning",
+    "prompt": "In one short sentence, what is the think-act-observe loop? Do not call any tools.",
+    "forbid_tools": ["calculator", "search", "python_exec", "wikipedia", "http_get"],
+    "answer_contains": ["think"],
+    "max_thinks": 3,
+    "max_iterations": 4,
+    "temperature": 0.2
+  }
+]

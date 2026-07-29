@@ -1,0 +1,17 @@
+[project]
+name = "visual-agent-harness"
+version = "0.1.0"
+description = "Educational LLM agent harness with a visual think→act→observe loop"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ollama>=0.4.0",
+    "openai>=1.40.0",
+    "streamlit>=1.38.0",
+    "requests>=2.32.0",
+    "rich>=13.7.0",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.uv]
+package = false

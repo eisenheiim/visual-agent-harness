@@ -1,0 +1,11 @@
+# Force light theme so custom sand background keeps dark, readable text.
+[theme]
+base = "light"
+primaryColor = "#0D7377"
+backgroundColor = "#FBF9F6"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1A1F24"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"

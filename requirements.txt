@@ -1,0 +1,20 @@
+# Visual Agent Harness — core dependencies
+# Install: pip install -r requirements.txt
+
+# Local LLM (primary — free, private, no API key required)
+ollama>=0.4.0
+
+# Optional cloud LLM backend
+openai>=1.40.0
+
+# Interactive visualization UI
+streamlit>=1.38.0
+
+# HTTP for DuckDuckGo / optional Tavily search
+requests>=2.32.0
+
+# Nice terminal output in examples
+rich>=13.7.0
+
+# Load secrets / config from a local .env file
+python-dotenv>=1.0.0
