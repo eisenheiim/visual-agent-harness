@@ -27,7 +27,7 @@ Most agent repos bury the magic under 15 abstractions.
 
 If you've ever asked *"what is the agent actually doing?"* — this repo is the answer you can run locally in two minutes.
 
-### Star-worthy because
+
 
 | | |
 |---|---|
