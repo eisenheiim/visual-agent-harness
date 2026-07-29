@@ -8,12 +8,7 @@
   <strong>See</strong> how LLM agents think, call tools, and remember — in a loop you can actually watch.
 </p>
 
-<p align="center">
-  <a href="#quickstart"><img src="https://img.shields.io/badge/quickstart-2%20minutes-0D7377?style=for-the-badge" alt="Quickstart" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-FF6B4A?style=for-the-badge" alt="MIT" /></a>
-  <a href="#stack"><img src="https://img.shields.io/badge/python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" /></a>
-  <a href="#stack"><img src="https://img.shields.io/badge/ollama-local%20first-white?style=for-the-badge" alt="Ollama" /></a>
-</p>
+
 
 <p align="center">
   <em>Education · Rapid prototyping · Visualization — not an enterprise framework.</em>
