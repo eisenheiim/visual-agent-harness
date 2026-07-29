@@ -48,9 +48,10 @@ def remember(text: str, tags: str = "") -> str:
 REMEMBER_TOOL = Tool(
     name="remember",
     description=(
-        "REQUIRED whenever the user says remember/save/keep/hatırla a fact. "
+        "ONLY when the user explicitly asks to remember/save/keep/hatırla a fact. "
+        "Do not call this for unrelated tasks (math, search, code). "
         "Writes into long-term RAG memory. Saying 'I will remember' in plain text "
-        "does NOT store anything — you must emit this tool call JSON first. "
+        "does NOT store anything — emit this tool call JSON first. "
         'Example: {"tool":"remember","arguments":{"text":"User favorite city is Tokyo","tags":"preference"}}'
     ),
     parameters={

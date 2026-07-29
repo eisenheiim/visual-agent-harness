@@ -34,10 +34,71 @@ from typing import Any, Iterable, Optional
 
 _TOKEN = re.compile(r"[a-z0-9_]+", re.IGNORECASE)
 
+# Tiny stopword list — stops "my/is/the" from matching unrelated pins to tool tasks.
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "am",
+        "i",
+        "me",
+        "my",
+        "we",
+        "our",
+        "you",
+        "your",
+        "it",
+        "its",
+        "this",
+        "that",
+        "with",
+        "as",
+        "at",
+        "by",
+        "from",
+        "what",
+        "which",
+        "who",
+        "how",
+        "when",
+        "where",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "would",
+        "should",
+        "will",
+        "just",
+        "about",
+        "into",
+        "use",
+        "using",
+        "please",
+        "tell",
+        "me",
+    }
+)
+
 
 def _tokenize(text: str) -> list[str]:
-    """Lowercase alphanumeric tokens — intentionally dumb and inspectable."""
-    return _TOKEN.findall(text.lower())
+    """Lowercase alphanumeric tokens — drop stopwords so RAG stays on-topic."""
+    return [t for t in _TOKEN.findall(text.lower()) if t not in _STOPWORDS and len(t) > 1]
 
 
 def _bag(text: str) -> dict[str, float]:
@@ -211,31 +272,24 @@ class Memory:
         self.long_term = [i for i in self.long_term if i.id != item_id]
         return len(self.long_term) < before
 
-    def recall(self, query: str, top_k: int = 3, min_score: float = 0.01) -> list[tuple[MemoryItem, float]]:
+    def recall(self, query: str, top_k: int = 3, min_score: float = 0.08) -> list[tuple[MemoryItem, float]]:
         """Return the top-k most similar long-term items (cosine over TF bags).
 
-        Falls back to any token-overlap match if nothing clears ``min_score`` —
-        educational demos often use short pins + short questions.
+        Only returns hits that clear ``min_score``. No "force inject recent
+        memories" fallback — that caused irrelevant pins (score 0.0) to derail
+        unrelated tool tasks.
         """
         if not self.long_term:
             return []
 
         q = _bag(query)
+        if not q:
+            return []
+
         scored = [(_cosine(q, item._bag), item) for item in self.long_term]
         strong = [(s, i) for s, i in scored if s >= min_score]
         strong.sort(key=lambda x: x[0], reverse=True)
-        if strong:
-            return [(item, score) for score, item in strong[:top_k]]
-
-        # Soft fallback: keep anything with any overlap, or last-pinned items
-        soft = [(s, i) for s, i in scored if s > 0]
-        soft.sort(key=lambda x: x[0], reverse=True)
-        if soft:
-            return [(item, score) for score, item in soft[:top_k]]
-
-        # Last resort: most recent memories (still better than silent miss)
-        recent = list(reversed(self.long_term))[:top_k]
-        return [(item, 0.0) for item in recent]
+        return [(item, score) for score, item in strong[:top_k]]
 
     def recall_text(self, query: str, top_k: int = 3) -> str:
         """Pretty block to inject into the system / user prompt."""

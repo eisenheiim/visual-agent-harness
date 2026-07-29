@@ -54,6 +54,21 @@ def _looks_like_remember_request(text: str) -> bool:
     return any(t in lower for t in triggers)
 
 
+def _explicit_tool_request(text: str, available: set[str]) -> Optional[str]:
+    """If the user named a tool (e.g. 'Use python_exec to …'), return that name."""
+    lower = (text or "").lower()
+    # Longer names first so python_exec wins over accidental substrings
+    for name in sorted(available, key=len, reverse=True):
+        n = name.lower()
+        patterns = (
+            rf"\b(?:use|call|run|with)\s+(?:the\s+)?`?{re.escape(n)}`?(?:\s+tool)?\b",
+            rf"\b`?{re.escape(n)}`?\s+tool\b",
+        )
+        if any(re.search(p, lower) for p in patterns):
+            return name
+    return None
+
+
 def _extract_remember_fact(text: str) -> str:
     """Best-effort pull of the fact the user asked to store."""
     patterns = (
@@ -94,17 +109,19 @@ def _format_think_payload(
                 f"  • [{hit.get('score', 0):.2f}] ({tags}) {hit.get('text', '')}"
             )
         lines.append("")
-    else:
-        lines.append("RAG hits: (none for this call)")
-        lines.append("")
 
     for i, msg in enumerate(messages, 1):
         role = msg.get("role", "?")
         content = (msg.get("content") or "").strip()
-        # Keep system short in the timeline; full text is in learner mode
-        limit = 160 if role == "system" else preview_chars
+        display_role = role
+        if content.startswith("[OBSERVATION from tool"):
+            display_role = "observation"
+        # Keep system short in the timeline; full text is on hover
+        limit = 160 if display_role == "system" else preview_chars
+        if display_role == "observation":
+            limit = min(preview_chars, 400)
         preview = content if len(content) <= limit else content[:limit].rstrip() + "…"
-        lines.append(f"── [{i}] {role} ({len(content)} chars) ──")
+        lines.append(f"── [{i}] {display_role} ({len(content)} chars) ──")
         lines.append(preview)
         lines.append("")
     return "\n".join(lines).rstrip()
@@ -205,11 +222,13 @@ Your job is to solve the user's request using step-by-step reasoning and tools w
 Rules:
 1. Prefer tools over guessing when a tool can give a precise answer.
 2. Never invent tool results — wait for the [OBSERVATION] message.
-3. Keep intermediate reasoning short; put the user-facing answer in {"final": "..."}.
-4. If a tool errors, try a different approach or explain the failure in your final answer.
-5. MEMORY IS A TOOL — saying "I'll remember" in text does NOTHING.
-   When the user asks you to remember / save / keep a fact or preference,
-   you MUST call the `remember` tool with that fact BEFORE {"final": "..."}.
+3. Emit EXACTLY ONE JSON object per reply — never concatenate tool + final on one line.
+4. When you need a tool: {"tool": "<name>", "arguments": { ... }} and NOTHING else.
+5. When done: {"final": "<answer>"} and NOTHING else.
+6. If a tool errors, try a different approach or explain the failure in your final answer.
+7. Use `remember` ONLY when the user explicitly asks to remember/save/keep/hatırla a fact.
+   Do NOT call `remember` just because a memory appears in context.
+   When they do ask, call remember BEFORE {"final": "..."}.
    Example:
      {"tool": "remember", "arguments": {"text": "User favorite city is Tokyo", "tags": "preference"}}
 """
@@ -372,6 +391,8 @@ class AgentHarness:
             rag_block = self.memory.recall_text(user_message, top_k=3)
             if rag_block:
                 prompt = f"{rag_block}\n\nUser request:\n{user_message}"
+            else:
+                rag_hits = []
 
         self.last_rag_hits = rag_hits
 
@@ -414,7 +435,12 @@ class AgentHarness:
 
         try:
             used_remember = False
+            used_tools: set[str] = set()
             wants_remember = _looks_like_remember_request(user_message) and "remember" in self.tools
+            required_tool = _explicit_tool_request(
+                user_message, {t.name for t in self.tools.list_tools()}
+            )
+            nudged_for_tool = False
 
             for iteration in range(1, self.max_iterations + 1):
                 # THINK -----------------------------------------------------
@@ -464,8 +490,9 @@ class AgentHarness:
                     )
                 )
 
-                # Parse decision --------------------------------------------
-                call: Optional[ToolCall] = self.tools.parse_tool_call(raw)
+                # Parse decision — ignore unsolicited remember (incl. aliases)
+                skip = set() if wants_remember else {"remember", "memory", "save_memory", "store"}
+                call: Optional[ToolCall] = self.tools.parse_tool_call(raw, skip_tools=skip)
 
                 def _ensure_remember_saved(iteration_n: int):
                     """Safety net when the model skips the remember tool."""
@@ -492,6 +519,7 @@ class AgentHarness:
                     )
                     observation = self.tools.execute_call(forced)
                     used_remember = True
+                    used_tools.add("remember")
                     self.memory.add_observation("remember", observation)
                     yield self._emit(
                         AgentStep(
@@ -505,6 +533,30 @@ class AgentHarness:
 
                 # No structured call → treat entire reply as the final answer
                 if call is None:
+                    if (
+                        required_tool
+                        and required_tool not in used_tools
+                        and not nudged_for_tool
+                        and iteration < self.max_iterations
+                    ):
+                        nudged_for_tool = True
+                        nudge = (
+                            f"Your last reply was not valid tool JSON. "
+                            f"The user asked you to use `{required_tool}`. "
+                            f'Respond with ONLY {{"tool": "{required_tool}", "arguments": {{...}}}}.'
+                        )
+                        self.memory.add_observation(required_tool, nudge)
+                        yield self._emit(
+                            AgentStep(
+                                event=AgentEvent.OBSERVATION,
+                                iteration=iteration,
+                                content=nudge,
+                                tool_name=required_tool,
+                                meta={"auto": True, "reason": "unstructured_missing_tool"},
+                            )
+                        )
+                        continue
+
                     yield from _ensure_remember_saved(iteration)
                     self.last_answer = raw.strip()
                     yield self._emit(
@@ -519,6 +571,32 @@ class AgentHarness:
 
                 # Explicit final --------------------------------------------
                 if call.name == "__final__":
+                    # User named a tool but model skipped it — nudge once
+                    if (
+                        required_tool
+                        and required_tool not in used_tools
+                        and not nudged_for_tool
+                        and iteration < self.max_iterations
+                    ):
+                        nudged_for_tool = True
+                        nudge = (
+                            f"You answered without calling `{required_tool}`. "
+                            f"The user asked you to use that tool. "
+                            f'Respond with ONLY {{"tool": "{required_tool}", "arguments": {{...}}}} '
+                            f"now — do not guess the result."
+                        )
+                        self.memory.add_observation(required_tool, nudge)
+                        yield self._emit(
+                            AgentStep(
+                                event=AgentEvent.OBSERVATION,
+                                iteration=iteration,
+                                content=nudge,
+                                tool_name=required_tool,
+                                meta={"auto": True, "reason": "missing_required_tool"},
+                            )
+                        )
+                        continue
+
                     yield from _ensure_remember_saved(iteration)
                     self.last_answer = str(call.arguments.get("answer", "")).strip()
                     yield self._emit(
@@ -532,8 +610,28 @@ class AgentHarness:
 
                 # ACT → OBSERVE ---------------------------------------------
                 resolved_name = self.tools.resolve_name(call.name)
+                # Hard block: never execute remember unless the user asked
+                if resolved_name == "remember" and not wants_remember:
+                    reject = (
+                        "Ignored unsolicited `remember` — the user did not ask to "
+                        "save a fact. Continue the actual task with the right tool "
+                        "or {\"final\": \"...\"}."
+                    )
+                    self.memory.add_observation("remember", reject)
+                    yield self._emit(
+                        AgentStep(
+                            event=AgentEvent.OBSERVATION,
+                            iteration=iteration,
+                            content=reject,
+                            tool_name="remember",
+                            meta={"auto": True, "reason": "rejected_unsolicited_remember"},
+                        )
+                    )
+                    continue
+
                 if resolved_name == "remember":
                     used_remember = True
+                used_tools.add(resolved_name)
                 yield self._emit(
                     AgentStep(
                         event=AgentEvent.TOOL_CALL,

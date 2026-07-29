@@ -198,51 +198,63 @@ class ToolRegistry:
     # -- parsing & execution ------------------------------------------------
 
     @staticmethod
-    def parse_tool_call(text: str) -> Optional[ToolCall]:
-        """Extract a TOOL_CALL or final answer from model output.
+    def _iter_json_objects(text: str) -> list[str]:
+        """Return balanced `{...}` slices in order (handles tool + final mashed together)."""
+        objects: list[str] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            if text[i] != "{":
+                i += 1
+                continue
+            depth = 0
+            in_str = False
+            escape = False
+            for j in range(i, n):
+                ch = text[j]
+                if in_str:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        objects.append(text[i : j + 1])
+                        i = j + 1
+                        break
+            else:
+                break
+        return objects
 
-        Tolerates markdown fences and surrounding prose — models are messy.
-        Returns None if neither a tool call nor a final answer is found.
-        """
-        cleaned = text.strip()
+    @staticmethod
+    def _tool_call_from_dict(data: dict[str, Any], raw: str) -> Optional[ToolCall]:
+        if "final" in data and "tool" not in data and "name" not in data:
+            return ToolCall(
+                name="__final__",
+                arguments={"answer": data["final"]},
+                raw=raw,
+            )
 
-        # Strip ```json ... ``` fences if present
-        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
-        if fence:
-            cleaned = fence.group(1)
-
-        # Find the first JSON object in the text
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if not match:
-            return None
-
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return None
-
-        if not isinstance(data, dict):
-            return None
-
-        # Final answer shortcut — treated as a special "tool" by the harness
-        if "final" in data:
-            return ToolCall(name="__final__", arguments={"answer": data["final"]}, raw=match.group(0))
-
-        # Canonical: {"tool": "name", "arguments": {...}}
         if "tool" in data:
             args = data.get("arguments") or data.get("args") or {}
             if not isinstance(args, dict):
                 args = {}
-            # Models often flatten args: {"tool":"search","query":"..."}
             if not args:
                 args = {
                     k: v
                     for k, v in data.items()
                     if k not in {"tool", "name", "arguments", "args", "final"}
                 }
-            return ToolCall(name=str(data["tool"]), arguments=args, raw=match.group(0))
+            return ToolCall(name=str(data["tool"]), arguments=args, raw=raw)
 
-        # Alternate: {"name": "...", "arguments": {...}}
         if "name" in data and ("arguments" in data or "args" in data or "query" in data):
             args = data.get("arguments") or data.get("args") or {}
             if not isinstance(args, dict):
@@ -253,8 +265,85 @@ class ToolRegistry:
                     for k, v in data.items()
                     if k not in {"tool", "name", "arguments", "args", "final"}
                 }
-            return ToolCall(name=str(data["name"]), arguments=args, raw=match.group(0))
+            return ToolCall(name=str(data["name"]), arguments=args, raw=raw)
 
+        # {"final": "..."} already handled; also tolerate final alongside junk keys
+        if "final" in data:
+            return ToolCall(
+                name="__final__",
+                arguments={"answer": data["final"]},
+                raw=raw,
+            )
+        return None
+
+    @staticmethod
+    def parse_tool_call(
+        text: str,
+        *,
+        skip_tools: Optional[set[str]] = None,
+    ) -> Optional[ToolCall]:
+        """Extract a tool call or final answer from model output.
+
+        Tolerates markdown fences, prose, and multiple JSON objects on one line
+        (e.g. ``{"tool":...}; {"final":...}``). Prefers a real tool call over
+        ``final`` when both appear, so the loop can ACT instead of dying as
+        ``unstructured_reply``.
+        """
+        cleaned = text.strip()
+        skip = {s.lower() for s in (skip_tools or set())}
+        # If skipping a canonical tool, also skip aliases that resolve to it
+        if skip:
+            for alias, canonical in _TOOL_ALIASES.items():
+                if canonical.lower() in skip:
+                    skip.add(alias.lower())
+
+        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
+        if fence:
+            cleaned = fence.group(1)
+
+        def _is_skipped(name: str) -> bool:
+            key = name.lower().strip()
+            if key in skip:
+                return True
+            alias_target = _TOOL_ALIASES.get(key.replace("-", "_")) or _TOOL_ALIASES.get(key)
+            return bool(alias_target and alias_target.lower() in skip)
+
+        candidates: list[ToolCall] = []
+        for raw_obj in ToolRegistry._iter_json_objects(cleaned):
+            try:
+                data = json.loads(raw_obj)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            call = ToolRegistry._tool_call_from_dict(data, raw_obj)
+            if call is None:
+                continue
+            if call.name != "__final__" and _is_skipped(call.name):
+                continue
+            candidates.append(call)
+
+        if not candidates:
+            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+            if not match:
+                return None
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(data, dict):
+                return None
+            call = ToolRegistry._tool_call_from_dict(data, match.group(0))
+            if call and call.name != "__final__" and _is_skipped(call.name):
+                return None
+            return call
+
+        tools = [c for c in candidates if c.name != "__final__"]
+        finals = [c for c in candidates if c.name == "__final__"]
+        if tools:
+            return tools[0]
+        if finals:
+            return finals[0]
         return None
 
     def execute(self, name: str, arguments: Optional[dict[str, Any]] = None) -> str:

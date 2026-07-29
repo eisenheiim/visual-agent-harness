@@ -22,6 +22,47 @@ from typing import Any, Optional
 
 from .harness import AgentEvent, AgentStep
 
+# Keep downloaded traces readable — these fields repeat the same multi-KB blob.
+_TRACE_META_OMIT = frozenset(
+    {
+        "system_prompt",
+        "model_reply",
+        "tool_schemas",
+        "prompt_sent_to_model",
+    }
+)
+
+
+def _sanitize_step_dict(step: dict[str, Any]) -> dict[str, Any]:
+    """Drop bulky prompt dumps from a step before saving a trace."""
+    out = dict(step)
+    meta_in = out.get("meta") or {}
+    if not isinstance(meta_in, dict):
+        return out
+    meta: dict[str, Any] = {
+        k: v for k, v in meta_in.items() if k not in _TRACE_META_OMIT
+    }
+    messages = meta.get("messages")
+    if isinstance(messages, list):
+        cleaned: list[dict[str, Any]] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "?")
+            content = msg.get("content") or ""
+            if role == "system":
+                cleaned.append(
+                    {
+                        "role": "system",
+                        "content": f"[omitted · {len(content)} chars]",
+                    }
+                )
+            else:
+                cleaned.append({"role": role, "content": content})
+        meta["messages"] = cleaned
+    out["meta"] = meta
+    return out
+
 
 @dataclass
 class RunTrace:
@@ -52,9 +93,9 @@ class RunTrace:
         normalized: list[dict[str, Any]] = []
         for step in steps:
             if isinstance(step, AgentStep):
-                normalized.append(step.to_dict())
+                normalized.append(_sanitize_step_dict(step.to_dict()))
             else:
-                normalized.append(dict(step))
+                normalized.append(_sanitize_step_dict(dict(step)))
 
         # Infer user message / answer from steps when not provided
         msg = user_message

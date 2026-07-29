@@ -12,6 +12,7 @@ agent loop is rendered as a live timeline so newcomers can *see* agents.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -23,8 +24,26 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core import AgentEvent, AgentHarness, Memory, build_trace_from_harness  # noqa: E402
+# Streamlit keeps imported modules in sys.modules across reruns — reload core so
+# harness/RAG/parser fixes apply without a manual server restart.
+import importlib
+
+import core.env as _core_env
+import core.memory as _core_memory
+import core.tool_registry as _core_tools
+import core.tracing as _core_tracing
+import core.harness as _core_harness
+
+importlib.reload(_core_env)
+importlib.reload(_core_memory)
+importlib.reload(_core_tools)
+importlib.reload(_core_tracing)
+importlib.reload(_core_harness)
+
 from core.env import load_env  # noqa: E402
+from core.harness import AgentEvent, AgentHarness  # noqa: E402
+from core.memory import Memory  # noqa: E402
+from core.tracing import build_trace_from_harness  # noqa: E402
 from tools import register_builtin_tools  # noqa: E402
 
 load_env()
@@ -480,94 +499,116 @@ def _step_field(step, name: str, default=None):
     return getattr(step, name, default)
 
 
-def _system_prompt_from_step(step) -> str:
-    """Prefer live messages, then step meta, then session fallback."""
-    meta = _step_meta(step)
-    for msg in meta.get("messages") or []:
-        if msg.get("role") == "system" and (msg.get("content") or "").strip():
-            return msg["content"]
-    sp = (meta.get("system_prompt") or "").strip()
-    if sp:
-        return sp
-    # Session-level copy set on RUN_START — survives odd step serialization
-    try:
-        return (st.session_state.get("system_prompt") or "").strip()
-    except Exception:
-        return ""
+def _classify_llm_message(msg: dict) -> tuple[str, str]:
+    """Return (display_role, tool_name) for a chat message sent to the model."""
+    role = msg.get("role") or "?"
+    content = msg.get("content") or ""
+    if role == "system":
+        return "system", ""
+    # Observations are folded into user role with a clear label (see Memory.as_chat_messages)
+    if content.startswith("[OBSERVATION from tool"):
+        tool = ""
+        start = content.find("`")
+        end = content.find("`", start + 1) if start >= 0 else -1
+        if start >= 0 and end > start:
+            tool = content[start + 1 : end]
+        return "observation", tool
+    return role, ""
+
+
+def _compact_system_prompt_for_display(text: str, tool_schemas: list | None = None) -> str:
+    """Keep rules; replace bulky tool catalog with names only."""
+    text = text or ""
+    names: list[str] = []
+    if tool_schemas:
+        names = [str(t.get("name") or "") for t in tool_schemas if t.get("name")]
+    if not names:
+        names = re.findall(r"^###\s+(\S+)", text, flags=re.MULTILINE)
+
+    marker = "Available tools:"
+    if marker in text:
+        head = text.split(marker, 1)[0].rstrip()
+    else:
+        # Fallback: cut at first ### tool heading
+        m = re.search(r"\n###\s+\S+", text)
+        head = text[: m.start()].rstrip() if m else text.rstrip()
+
+    if names:
+        listing = ", ".join(f"`{n}`" for n in names)
+        return f"{head}\n\nAvailable tools (names only): {listing}"
+    return head or text
 
 
 def _think_hover_html(step, *, include_reply: bool = False) -> str:
-    """Hover panel — system prompt first (pulled from messages / session)."""
+    """Hover panel — system + tool observations + other messages sent to the model."""
+    del include_reply  # kept for call-site compatibility
     meta = _step_meta(step)
-    system_prompt = _system_prompt_from_step(step)
-    messages = meta.get("messages") or []
-    rag_hits = meta.get("rag_hits") or st.session_state.get("rag_hits") or []
+    messages = list(meta.get("messages") or [])
+    rag_hits = meta.get("rag_hits") or []
+    rag_injected = bool(meta.get("rag_injected")) and bool(rag_hits)
+    tool_schemas = meta.get("tool_schemas") or st.session_state.get("tool_schemas") or []
 
-    hint = (
-        "Hover: model reply + system prompt"
-        if include_reply
-        else "Hover: system prompt is at the top"
-    )
+    system_msgs = []
+    observation_msgs = []
+    other_msgs = []
+    for msg in messages:
+        kind, tool = _classify_llm_message(msg)
+        if kind == "system":
+            system_msgs.append(msg)
+        elif kind == "observation":
+            observation_msgs.append((msg, tool))
+        else:
+            other_msgs.append(msg)
+
     parts: list[str] = [
         '<div class="step-hover" tabindex="0">',
-        f'<div class="hint">{_esc(hint)}</div>',
+        '<div class="hint">Hover: what the model receives this THINK</div>',
     ]
 
-    if include_reply:
-        reply = meta.get("model_reply") or _step_field(step, "content") or ""
-        parts.append("<h4>Model reply (raw)</h4>")
-        parts.append(f"<pre>{_esc(reply) if reply else '(empty)'}</pre>")
-
-    parts.append(
-        f"<h4>System prompt · {len(system_prompt)} chars · every THINK as messages[0]</h4>"
-    )
-    parts.append('<div class="sys-box">')
-    if system_prompt:
-        parts.append(f"<pre>{_esc(system_prompt)}</pre>")
-    else:
+    if rag_injected:
+        lt = meta.get("long_term_count")
         parts.append(
-            "<pre>(missing) No system message found. "
-            "Click Reset conversation, then Run again.</pre>"
+            f"<h4>RAG hits · store size {lt if lt is not None else '?'}</h4>"
         )
-    parts.append("</div>")
-
-    lt = meta.get("long_term_count")
-    parts.append(
-        f"<h4>RAG hits · store size {lt if lt is not None else '?'}</h4>"
-    )
-    if rag_hits:
         lines = [
             f"[{hit.get('score', 0):.2f}] ({', '.join(hit.get('tags') or []) or '—'}) {hit.get('text', '')}"
             for hit in rag_hits
         ]
         parts.append(f"<pre>{_esc(chr(10).join(lines))}</pre>")
-    else:
-        parts.append(
-            "<pre>(none) Pin a memory first, keep RAG checked, then ask a related question.</pre>"
-        )
 
-    parts.append(f"<h4>All messages ({len(messages)})</h4>")
-    if messages:
+    # System prompt — rules + tool names only (no descriptions / schemas)
+    parts.append("<h4>System prompt</h4>")
+    parts.append('<div class="sys-box">')
+    if system_msgs:
+        raw = system_msgs[0].get("content") or ""
+        shown = _compact_system_prompt_for_display(raw, tool_schemas)
+        parts.append(f"<pre>{_esc(shown)}</pre>")
+    else:
+        parts.append("<pre>(missing)</pre>")
+    parts.append("</div>")
+
+    # Tool observations next to system — only when present (after a tool turn)
+    if observation_msgs:
+        parts.append(f"<h4>Tool observations sent to model ({len(observation_msgs)})</h4>")
+        blocks = []
+        for msg, tool in observation_msgs:
+            content = msg.get("content") or ""
+            label = f"observation · {tool}" if tool else "observation"
+            shown = content if len(content) <= 2000 else content[:2000] + f"\n… ({len(content)} chars)"
+            blocks.append(f"── {label} ({len(content)} chars) ──\n{shown}")
+        parts.append(f"<pre>{_esc(chr(10).join(blocks))}</pre>")
+
+    parts.append(f"<h4>Other messages ({len(other_msgs)})</h4>")
+    if other_msgs:
         msg_blocks = []
-        for i, msg in enumerate(messages, 1):
+        for i, msg in enumerate(other_msgs, 1):
             role = msg.get("role", "?")
             content = msg.get("content") or ""
-            if role == "system" and len(content) > 400:
-                shown = (
-                    content[:400]
-                    + f"\n… ({len(content)} chars — full text in System prompt above)"
-                )
-            else:
-                shown = content
+            shown = content if len(content) <= 1200 else content[:1200] + f"\n… ({len(content)} chars)"
             msg_blocks.append(f"── [{i}] {role} ({len(content)} chars) ──\n{shown}")
         parts.append(f"<pre>{_esc(chr(10).join(msg_blocks))}</pre>")
     else:
-        parts.append("<pre>(no messages)</pre>")
-
-    schemas = meta.get("tool_schemas") or st.session_state.get("tool_schemas") or []
-    if schemas and not include_reply:
-        parts.append("<h4>Tool schemas</h4>")
-        parts.append(f"<pre>{_esc(json.dumps(schemas, indent=2))}</pre>")
+        parts.append("<pre>(none)</pre>")
 
     parts.append("</div>")
     return "".join(parts)
@@ -600,23 +641,51 @@ def _render_step(step) -> str:
     elif ev == AgentEvent.THINK_START.value:
         kind += " think-in"
         n = meta.get("message_count") or len(meta.get("messages") or [])
-        sys_len = len(_system_prompt_from_step(step))
-        rag_n = len(meta.get("rag_hits") or [])
-        label = (
-            f"THINK START · iter {iteration} · {n} msgs · "
-            f"system {sys_len} chars · rag {rag_n}"
+        rag_hits = meta.get("rag_hits") or []
+        rag_n = len(rag_hits) if meta.get("rag_injected") else 0
+        messages = meta.get("messages") or []
+        obs = []
+        sys_len = 0
+        for msg in messages:
+            kind_m, tool = _classify_llm_message(msg)
+            if kind_m == "system":
+                sys_len = len(msg.get("content") or "")
+            elif kind_m == "observation":
+                content = msg.get("content") or ""
+                preview = content if len(content) <= 220 else content[:220].rstrip() + "…"
+                obs.append((tool or "tool", preview, len(content)))
+
+        bits = [f"Calling the model with {n} message(s)"]
+        if sys_len:
+            bits.append(f"system {sys_len} chars")
+        if rag_n:
+            bits.append(f"rag {rag_n}")
+        if obs:
+            bits.append(f"{len(obs)} tool observation(s)")
+        label = f"THINK START · iter {iteration} · " + " · ".join(
+            [f"{n} msgs"] + ([f"rag {rag_n}"] if rag_n else []) + ([f"obs {len(obs)}"] if obs else [])
         )
-        if not str(body).strip():
-            body = "Calling the model…"
+        body_lines = [" · ".join(bits), ""]
+        if sys_len:
+            body_lines.append(f"── system ({sys_len} chars) ──")
+            body_lines.append("(full text on hover)")
+            body_lines.append("")
+        for tool, preview, length in obs:
+            body_lines.append(f"── observation · {tool} ({length} chars) ──")
+            body_lines.append(preview)
+            body_lines.append("")
+        body = "\n".join(body_lines).rstrip()
         hover = _think_hover_html(step, include_reply=False)
     elif ev == AgentEvent.THINK_END.value:
         kind += " think-out"
-        label = f"THINK · model reply · iteration {iteration}"
+        label = f"THINK END · iteration {iteration}"
+        n = len(str(body))
+        body = f"Model responded ({n} chars)"
         hover = _think_hover_html(step, include_reply=True)
     elif ev == AgentEvent.RUN_START.value:
         hits = meta.get("rag_hits") or []
-        lt = meta.get("long_term_count", "?")
         if meta.get("rag_injected") and hits:
+            lt = meta.get("long_term_count", "?")
             rag_lines = [f"RAG injected ({len(hits)} hit(s) from store size {lt}):"]
             for hit in hits:
                 tags = ", ".join(hit.get("tags") or []) or "—"
@@ -625,11 +694,7 @@ def _render_step(step) -> str:
                 )
             body = f"User: {body}\n\n" + "\n".join(rag_lines)
         else:
-            body = (
-                f"User: {body}\n\n"
-                f"RAG: none injected (store size {lt}, "
-                f"use_rag={meta.get('use_rag')})"
-            )
+            body = f"User: {body}"
     elif ev == AgentEvent.RUN_END.value:
         body = body or "Run finished."
 
@@ -687,11 +752,11 @@ if go and user_prompt.strip():
 
             # Status line
             if step.event == AgentEvent.THINK_START:
-                status.write(
-                    f"Iteration {step.iteration}: thinking… "
-                    f"(system {len(step.meta.get('system_prompt') or '')} chars, "
-                    f"rag {len(step.meta.get('rag_hits') or [])})"
-                )
+                rag_n = len(step.meta.get("rag_hits") or []) if step.meta.get("rag_injected") else 0
+                if rag_n:
+                    status.write(f"Iteration {step.iteration}: thinking… (rag {rag_n})")
+                else:
+                    status.write(f"Iteration {step.iteration}: thinking…")
             elif step.event == AgentEvent.TOOL_CALL:
                 status.write(f"Calling tool `{step.tool_name}`…")
             elif step.event == AgentEvent.OBSERVATION:
@@ -878,20 +943,16 @@ if st.session_state.learner_mode:
                 for note in notes:
                     st.markdown(f"- {note}")
     with a2:
-        with st.expander("RAG hits (this turn)", expanded=True):
-            hits = st.session_state.rag_hits or []
-            if not st.session_state.steps:
-                st.caption("No run yet.")
-            elif not hits:
-                st.caption("No RAG hits for this turn.")
-            else:
+        hits = st.session_state.rag_hits or []
+        if st.session_state.rag_injected and hits:
+            with st.expander("RAG hits (this turn)", expanded=True):
                 for hit in hits:
                     tags = ", ".join(hit.get("tags") or []) or "—"
                     st.markdown(
                         f"`{hit.get('id', '?')}` · score **{hit.get('score', 0):.2f}** · _{tags}_"
                     )
                     st.write(hit.get("text", ""))
-                if st.session_state.prompt_sent and st.session_state.rag_injected:
+                if st.session_state.prompt_sent:
                     with st.popover("Full user prompt sent to model"):
                         st.code(st.session_state.prompt_sent, language="text")
 
@@ -901,19 +962,21 @@ if st.session_state.learner_mode:
             st.caption("Run the agent to capture the exact chat payload for each THINK.")
         else:
             for batch in batches:
-                st.markdown(f"**Iteration {batch['iteration']}** — {len(batch['messages'])} messages")
-                st.code(json.dumps(batch["messages"], indent=2, ensure_ascii=False), language="json")
+                st.markdown(
+                    f"**Iteration {batch['iteration']}** — {len(batch['messages'])} messages"
+                )
+                st.code(
+                    json.dumps(batch["messages"], indent=2, ensure_ascii=False),
+                    language="json",
+                )
 
-    with st.expander("System prompt + tool schemas", expanded=False):
-        system_prompt = st.session_state.system_prompt or ""
+    with st.expander("Tool schemas", expanded=False):
         schemas = st.session_state.tool_schemas or []
-        if not system_prompt and not schemas:
-            st.caption("Run the agent once — the system message is rebuilt each run.")
+        if not schemas:
+            st.caption("Run the agent once to capture registered tool schemas.")
         else:
-            st.markdown("**System prompt** (includes the tool catalog)")
-            st.code(system_prompt or "(empty)", language="text")
-            st.markdown("**Tool schemas** (JSON)")
             st.code(json.dumps(schemas, indent=2), language="json")
+        st.caption("System prompt is hidden from the UI — see `core/harness.py` if you need it.")
 else:
     st.caption("Tip: enable **Learner mode** in the sidebar to inspect anatomy, RAG, and raw model messages.")
 
